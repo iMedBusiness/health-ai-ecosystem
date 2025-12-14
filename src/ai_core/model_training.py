@@ -1,59 +1,46 @@
 # src/ai_core/model_training.py
 
-import pandas as pd
-import numpy as np
 import joblib
+import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-
 def train_random_forest(
     df,
-    target_col="y",
-    exclude_cols=("ds",),
+    feature_cols,
+    target_col,
+    test_size=0.2,
+    random_state=42,
     save_model_path=None
 ):
     """
-    Train Random Forest model with automatic categorical encoding
+    Generic Random Forest trainer (used for demand or lead time).
     """
 
-    # Separate target
+    X = df[feature_cols]
     y = df[target_col]
 
-    # Drop excluded + target columns
-    X = df.drop(columns=[target_col] + list(exclude_cols))
-
-    # ✅ Encode categorical features automatically
-    X = pd.get_dummies(X, drop_first=True)
-
-    # Train / test split
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
+        X, y, test_size=test_size, random_state=random_state
     )
 
-    # Model
     model = RandomForestRegressor(
         n_estimators=200,
-        random_state=42,
-        n_jobs=-1
+        max_depth=10,
+        random_state=random_state
     )
 
     model.fit(X_train, y_train)
 
-    # Predictions
     y_pred = model.predict(X_test)
 
-    # Metrics
-    rmse = mean_squared_error(y_test, y_pred) ** 0.5
     metrics = {
         "MAE": mean_absolute_error(y_test, y_pred),
-        "RMSE": rmse,
+        "RMSE": np.sqrt(mean_squared_error(y_test, y_pred))
     }
 
-    # Save model
     if save_model_path:
         joblib.dump(model, save_model_path)
-        print(f"✅ Model saved to {save_model_path}")
 
-    return model, X_test, y_test, metrics
+    return model, metrics
