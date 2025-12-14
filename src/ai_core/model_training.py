@@ -44,3 +44,40 @@ def train_random_forest(
         joblib.dump(model, save_model_path)
 
     return model, metrics
+
+def train_lead_time_model(df):
+    """
+    Train Random Forest model to predict lead time.
+
+    """
+
+    feature_cols = [
+        "stock_on_hand",
+        "day_of_week",
+        "month"
+    ]
+    target_col = "lead_time_days"
+    
+    x = df[feature_cols]
+    y = df[target_col]
+    
+    x_train, x_test, y_train, y_test = train_test_split(
+        x, y, test_size=0.2, random_state=42
+    )
+    
+    model = RandomForestRegressor(
+        n_estimators=200,
+        max_depth=8,
+        random_state=42
+    )
+    
+    model.fit(x_train, y_train)
+    
+    y_pred = model.predict(x_test)
+    
+    metrics = {
+        "MAE": mean_absolute_error(y_test, y_pred),
+        "RMSE": np.sqrt(mean_squared_error(y_test, y_pred))
+    }
+    
+    return model, metrics
