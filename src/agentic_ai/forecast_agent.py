@@ -2,6 +2,7 @@
 
 from ai_core.data_pipeline import load_data, preprocess_data
 from ai_core.model_training import train_random_forest
+from ai_core.future_forecast import forecast_future_demand
 
 class ForecastAgent:
     """
@@ -44,3 +45,26 @@ class ForecastAgent:
         print("📊 Metrics:", metrics)
 
         return model, metrics
+    
+    def run_future_forecast(
+        self,
+        model,
+        df_processed,
+        periods=30
+    ):
+        feature_cols = [
+            "y",
+            "stock_on_hand",
+            "day_of_week",
+            "month"
+        ]
+
+        forecast_df = forecast_future_demand(
+            model=model,
+            df_history=df_processed,
+            feature_cols=feature_cols,
+            periods=periods
+        )
+
+        print(f"✅ Generated {periods}-day demand forecast")
+        return forecast_df
