@@ -13,6 +13,7 @@ from ai_core.explainability import (
     compute_shap_values, plot_global_importance)
 import shap
 import matplotlib.pyplot as plt
+from agentic_ai.explainable_reorder import ExplainableReorderAgent
 
 # --------------------------------------------------
 # PAGE CONFIG
@@ -240,6 +241,17 @@ if uploaded_file and run_button:
     )
 
     st.dataframe(reorder_df, use_container_width=True)
+
+    # -------------------------------
+    # EXPLAINABLE REORDER INSIGHTS
+    # -------------------------------
+    st.subheader("🧠 Why are reorder points high?")
+
+    explain_agent = ExplainableReorderAgent()
+    explanations = explain_agent.explain_reorder_drivers(reorder_df)
+
+    for exp in explanations:
+        st.info(exp)
 
     # --------------------------------------------------
     # EXECUTIVE NARRATIVE
