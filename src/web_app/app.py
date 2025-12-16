@@ -38,6 +38,7 @@ forecast_horizon = st.sidebar.selectbox(
     [7, 14, 30, 60]
 )
 
+batch_mode = st.sidebar.checkbox("📦 Batch forecast (all facilities & items)", value=False)
 uploaded_file = st.sidebar.file_uploader(
     "Upload Supply Chain CSV",
     type=["csv"]
@@ -140,6 +141,32 @@ if uploaded_file and run_button:
     st.plotly_chart(fig, use_container_width=True)
 
     # -------------------------------
+    # BATCH FORECAST (ALL FACILITY/ITEM)
+    # -------------------------------
+    if batch_mode:
+        st.markdown("---")
+        st.subheader("🏭 Batch Forecast (All Facilities & Items)")
+
+        try:
+            batch_df = agent.run_batch_forecast(
+                model=demand_model,
+                df=df,
+            periods=forecast_horizon
+            )
+
+            st.success(f"✅ Batch forecast generated: {batch_df[['facility','item']].drop_duplicates().shape[0]} combinations")
+            st.dataframe(batch_df.tail(50), use_container_width=True)
+
+            # Optional: quick chart by facility (sum forecast)
+            agg = batch_df.groupby(["ds", "facility"], as_index=False)["forecast"].sum()
+            fig_batch = px.line(agg, x="ds", y="forecast", color="facility", markers=False,
+                                title="Total Forecast by Facility (All Items)")
+            st.plotly_chart(fig_batch, use_container_width=True)
+
+        except Exception as e:
+            st.error(f"Batch forecasting failed: {e}")
+
+    # -------------------------------
     # SHAP EXPLAINABILITY
     # ------------------------------
 
@@ -190,6 +217,15 @@ if uploaded_file and run_button:
 
     st.dataframe(batch_forecast_df.tail(20), use_container_width=True)
 
+    # --------------------------------
+    # PREPARE LEAD TIME DATA
+    # --------------------------------
+    lead_time_df = (
+        df_raw
+        .groupby(["facility", "item"], as_index=False)
+        .agg({"lead_time_days": "mean"})
+    )
+
     # --------------------------------------------------
     # REORDER POINT & SAFETY STOCK
     # --------------------------------------------------
@@ -198,7 +234,10 @@ if uploaded_file and run_button:
     st.subheader("📦 Reorder Points & Safety Stock")
 
     reorder_agent = ReorderAgent()
-    reorder_df = reorder_agent.compute_reorder_point(batch_forecast_df)
+    reorder_df = reorder_agent.compute_reorder_point(
+        forecast_df=batch_forecast_df,
+        lead_time_df=lead_time_df
+    )
 
     st.dataframe(reorder_df, use_container_width=True)
 
@@ -207,9 +246,14 @@ if uploaded_file and run_button:
     # --------------------------------------------------
     from agentic_ai.narrative_agent import NarrativeAgent
 
-    st.subheader("📝 Executive Summary for COO")
+    api_key = None
 
-    narrative_agent = NarrativeAgent()
+    try:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        api_key = None  # No secrets file → safe fallback
+
+    narrative_agent = NarrativeAgent(api_key=api_key)
     summary = narrative_agent.generate_summary(reorder_df)
 
     st.markdown(summary)

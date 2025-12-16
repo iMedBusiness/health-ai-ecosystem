@@ -8,30 +8,47 @@ class ReorderAgent:
     def compute_reorder_point(
         self,
         forecast_df,
-        lead_time_col="lead_time_days",
+        lead_time_df,
         demand_col="forecast",
-        service_level=1.65  # 95% service level ~ 1.65 z-score
+        lead_time_col="lead_time_days",
+        service_level_z=1.65
     ):
         """
-        safety_stock = z * std_dev_demand * sqrt(lead_time)
-        reorder_point = avg_demand * lead_time + safety_stock
+        Computes safety stock and reorder point using:
+        - forecasted demand
+        - historical average lead time
         """
-        reorder_list = []
 
-        grouped = forecast_df.groupby(["facility", "item"])
-        for (facility, item), group in grouped:
-            avg_demand = group[demand_col].mean()
-            std_demand = group[demand_col].std()
-            lead_time = group[lead_time_col].mean()
+        results = []
 
-            safety_stock = service_level * std_demand * np.sqrt(lead_time)
+        # Merge lead time into forecast
+        df = forecast_df.merge(
+            lead_time_df,
+            on=["facility", "item"],
+            how="left"
+        )
+
+        if lead_time_col not in df.columns:
+            raise ValueError("lead_time_days not found after merge")
+
+        for (facility, item), g in df.groupby(["facility", "item"]):
+            avg_demand = g[demand_col].mean()
+            std_demand = g[demand_col].std()
+            lead_time = g[lead_time_col].mean()
+
+            if pd.isna(lead_time):
+                continue
+
+            safety_stock = service_level_z * std_demand * (lead_time ** 0.5)
             reorder_point = avg_demand * lead_time + safety_stock
 
-            reorder_list.append({
+            results.append({
                 "facility": facility,
                 "item": item,
+                "avg_daily_demand": round(avg_demand, 2),
+                "lead_time_days": round(lead_time, 1),
                 "safety_stock": round(safety_stock, 2),
                 "reorder_point": round(reorder_point, 2)
             })
 
-        return pd.DataFrame(reorder_list)
+        return pd.DataFrame(results)

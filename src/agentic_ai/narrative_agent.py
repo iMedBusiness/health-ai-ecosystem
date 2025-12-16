@@ -1,32 +1,64 @@
 import openai
 
 class NarrativeAgent:
-    """
-    Generates executive summaries / insights using OpenAI GPT.
-    """
-    def __init__(self, api_key):
-        openai.api_key = api_key
+    def __init__(self, api_key=None):
+        self.api_key = api_key
 
-    def generate_summary(self, forecast_df):
+    def generate_summary(self, reorder_df):
         """
-        Returns a text summary highlighting top changes, risks, and recommendations.
-        """
-        # Simple example: summarize total forecast change by facility
-        summary_prompt = f"""
-        Generate a short executive summary for the COO based on the following forecast data:
-
-        {forecast_df.groupby('facility')['forecast'].sum().to_dict()}
-
-        Highlight:
-        1. Facilities with highest forecast increase
-        2. Potential stockout risks
-        3. Recommendations
+        Generate executive summary.
+        Falls back to rule-based text if no API key is provided.
         """
 
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": summary_prompt}],
-            temperature=0.5
+        # -----------------------------
+        # RULE-BASED FALLBACK (SAFE)
+        # -----------------------------
+        high_risk = reorder_df.sort_values(
+            "reorder_point", ascending=False
+        ).head(3)
+
+        summary = (
+            "### Executive Summary (COO)\n\n"
+            f"- {len(reorder_df)} item–facility combinations analyzed\n"
+            "- Top replenishment risks identified:\n"
         )
 
-        return response.choices[0].message["content"]
+        for _, r in high_risk.iterrows():
+            summary += (
+                f"  • **{r['item']}** at **{r['facility']}** "
+                f"(Reorder Point: {r['reorder_point']})\n"
+            )
+
+        summary += (
+            "\n**Recommendations:**\n"
+            "- Prioritize procurement for high-risk items\n"
+            "- Review supplier lead-time stability\n"
+            "- Consider redistributing stock across facilities\n"
+        )
+
+        # -----------------------------
+        # OPTIONAL LLM ENHANCEMENT
+        # -----------------------------
+        if self.api_key:
+            try:
+                import openai
+                openai.api_key = self.api_key
+
+                prompt = (
+                    "Rewrite the following executive summary in a more "
+                    "concise, strategic tone for a COO:\n\n" + summary
+                )
+
+                response = openai.ChatCompletion.create(
+                    model="gpt-4",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3
+                )
+
+                return response.choices[0].message["content"]
+
+            except Exception:
+                # If OpenAI fails, fall back safely
+                return summary
+
+        return summary

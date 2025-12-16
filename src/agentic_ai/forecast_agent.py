@@ -125,6 +125,8 @@ class ForecastAgent:
                 )
                 forecast_df[facility_col] = facility
                 forecast_df[item_col] = item
+                forecast_df["forecast_horizon_days"] = periods
+                forecast_df["model_type"] = "random_forest"
 
                 forecast_list.append(forecast_df)
 
