@@ -33,7 +33,7 @@ class ReorderAgent:
 
         for (facility, item), g in df.groupby(["facility", "item"]):
             avg_demand = g[demand_col].mean()
-            std_demand = g[demand_col].std()
+            std_demand = g[demand_col].std(ddof=0) or 0.0
             lead_time = g[lead_time_col].mean()
 
             if pd.isna(lead_time):
