@@ -14,6 +14,8 @@ from ai_core.explainability import (
 import shap
 import matplotlib.pyplot as plt
 from agentic_ai.explainable_reorder import ExplainableReorderAgent
+from agentic_ai.inventory_simulation_agent import InventorySimulationAgent
+
 
 # --------------------------------------------------
 # PAGE CONFIG
@@ -253,23 +255,101 @@ if uploaded_file and run_button:
     for exp in explanations:
         st.info(exp)
 
-    # --------------------------------------------------
-    # EXECUTIVE NARRATIVE
-    # --------------------------------------------------
+    # -------------------------------
+    # INVENTORY SIMULATION
+    # -------------------------------
+    st.markdown("---")
+    st.subheader("📉 Inventory Simulation (Stockout Risk)")
+
+    # Build inventory_df from raw input (starting stock per facility/item)
+    possible_stock_cols = [
+        "stock_on_hand",
+        "current_stock",
+        "on_hand",
+        "stock"
+    ]
+    stock_col = None
+    for c in possible_stock_cols:
+        if c in df_raw.columns:
+            stock_col = c
+            break
+
+    if stock_col is None:
+        raise ValueError(
+            "No stock column found. Expected one of: "
+            f"{possible_stock_cols}"
+        )
+
+    inventory_df = (
+        df_raw
+        .sort_values("date")
+        .groupby(["facility", "item"], as_index=False)
+        .agg({stock_col: "last"})
+        .rename(columns={stock_col: "stock_on_hand"})
+    )
+
+    st.write("🔍 Inventory DF columns:", inventory_df.columns.tolist())
+    st.write("🔍 Inventory DF preview:", inventory_df.head())
+
+    if "stock_on_hand" not in inventory_df.columns:
+        st.error("❌ stock_on_hand missing in inventory_df")
+        st.stop()
+    
+    sim_agent = InventorySimulationAgent()
+
+    for col in ["facility", "item"]:
+        batch_forecast_df[col] = batch_forecast_df[col].astype(str).str.strip()
+        inventory_df[col] = inventory_df[col].astype(str).str.strip()
+        reorder_df[col] = reorder_df[col].astype(str).str.strip()
+    
+    cols_to_drop = [
+        c for c in batch_forecast_df.columns
+        if c.startswith("stock_on_hand")
+    ]
+
+    if cols_to_drop:
+        batch_forecast_df = batch_forecast_df.drop(columns=cols_to_drop)
+    
+    sim_df = sim_agent.simulate(
+        forecast_df=batch_forecast_df,
+        inventory_df=inventory_df,
+        reorder_df=reorder_df,
+        stock_col="stock_on_hand"
+    )
+
+    st.dataframe(sim_df, use_container_width=True)
+
+    # Highlight urgent risks
+    urgent = sim_df.sort_values(["reorder_now", "days_of_cover"], ascending=[False, True]).head(10)
+
+    st.subheader("🚨 Top 10 Urgent Risks")
+    st.dataframe(urgent, use_container_width=True)
+
+
+
+    # -------------------------------
+    # COO EXECUTIVE NARRATIVE
+    # -------------------------------
     from agentic_ai.narrative_agent import NarrativeAgent
+    
+    st.markdown("---")
+    st.subheader("🧠 Executive Summary (COO View)")
 
     api_key = None
-
     try:
         api_key = st.secrets["OPENAI_API_KEY"]
     except Exception:
-        api_key = None  # No secrets file → safe fallback
-
+        api_key = None
+    
     narrative_agent = NarrativeAgent(api_key=api_key)
-    summary = narrative_agent.generate_summary(reorder_df)
 
-    st.markdown(summary)
+    coo_summary = narrative_agent.generate_coo_summary(
+        reorder_df=reorder_df,
+        sim_df=sim_df,
+        forecast_horizon_days=forecast_horizon
+    )
 
+    st.markdown(coo_summary if coo_summary else "⚠️ No executive narrative generated.")
 # --------------------------------------------------
 # FOOTER
 # --------------------------------------------------
