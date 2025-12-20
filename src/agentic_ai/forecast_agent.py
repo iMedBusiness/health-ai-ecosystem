@@ -9,6 +9,11 @@ from ai_core.explainability import (
 )
 import shap
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from ai_core.model_cache import (
+    load_cached_model,
+    save_cached_model
+)
 
 class ForecastAgent:
     """
@@ -93,47 +98,100 @@ class ForecastAgent:
         print(f"✅ Generated {periods}-day demand forecast")
         return forecast_df
     
+
     def run_batch_forecast(
         self,
         df,
-        item_col="item",
-        facility_col="facility",
-        date_col="ds",
-        target_col="y",
-        model=None,
-        periods=30
+        periods=30,
+        cache_dir="models/cache",
+        force_retrain=False,
+        parallel=True,
+        max_workers=4
     ):
-        """
-        Run forecasting across multiple items and facilities.
-        Returns a concatenated DataFrame with forecasts.
-        """
-        forecast_list = []
+        from ai_core.model_training import train_random_forest
+        from ai_core.future_forecast import forecast_future_demand
+        from ai_core.model_cache import load_cached_model, save_cached_model
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import pandas as pd
+        import time
 
-        unique_items = df[item_col].unique()
-        unique_facilities = df[facility_col].unique()
+        required_cols = {"facility", "item", "ds", "y", "day_of_week", "month"}
+        missing = required_cols - set(df.columns)
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
 
-        for facility in unique_facilities:
-            for item in unique_items:
-                df_subset = df[(df[facility_col] == facility) & (df[item_col] == item)]
-                if df_subset.empty:
-                    continue
+        feature_cols = ["day_of_week", "month"]
 
-                forecast_df = self.run_future_forecast(
-                    model=model,
-                    df_processed=df_subset,
-                    periods=periods
+        groups = []
+        for (facility, item), g in df.groupby(["facility", "item"]):
+            g = g.sort_values("ds")
+            if len(g) >= 5:
+                groups.append((facility, item, g))
+
+        if not groups:
+            raise ValueError("No valid facility–item combinations")
+
+        metrics = []
+        results = []
+
+        def _worker(facility, item, g):
+            start = time.time()
+            model_name = "rf_demand"
+            cache_hit = False
+
+            model = None
+            if not force_retrain:
+                model, _ = load_cached_model(cache_dir, facility, item, model_name)
+                cache_hit = model is not None
+
+            if model is None:
+                model, _ = train_random_forest(
+                    df=g,
+                    feature_cols=feature_cols,
+                    target_col="y"
                 )
-                forecast_df[facility_col] = facility
-                forecast_df[item_col] = item
-                forecast_df["forecast_horizon_days"] = periods
-                forecast_df["model_type"] = "random_forest"
+                save_cached_model(model, cache_dir, facility, item, model_name)
 
-                forecast_list.append(forecast_df)
+            future_df = forecast_future_demand(
+                model=model,
+                df_history=g,
+                feature_cols=feature_cols,
+                periods=periods
+            )
+            future_df["facility"] = facility
+            future_df["item"] = item
 
-        if forecast_list:
-            return pd.concat(forecast_list, axis=0).reset_index(drop=True)
+            duration = round(time.time() - start, 3)
+
+            metric = {
+                "facility": facility,
+                "item": item,
+                "cache_hit": cache_hit,
+                "runtime_sec": duration
+            }
+
+            return future_df, metric
+
+        if parallel:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = [
+                    ex.submit(_worker, f, i, g)
+                    for f, i, g in groups
+                ]
+                for f in as_completed(futures):
+                    forecast_df, metric = f.result()
+                    results.append(forecast_df)
+                    metrics.append(metric)
         else:
-            return pd.DataFrame()
+            for f, i, g in groups:
+                forecast_df, metric = _worker(f, i, g)
+                results.append(forecast_df)
+                metrics.append(metric)
+
+        return {
+            "forecast": pd.concat(results, ignore_index=True),
+            "metrics": pd.DataFrame(metrics)
+        }
 
     def compute_shap(self, model, df, feature_cols, sample_size=100):
         """

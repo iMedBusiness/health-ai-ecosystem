@@ -1,359 +1,255 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import requests
 
-from ai_core.data_pipeline import preprocess_data
-from ai_core.model_training import (
-    train_random_forest,
-    train_lead_time_model
-)
-from agentic_ai.forecast_agent import ForecastAgent
-from agentic_ai.reasoning_agent import ReasoningAgent
-from ai_core.explainability import (
-    compute_shap_values, plot_global_importance)
-import shap
-import matplotlib.pyplot as plt
-from agentic_ai.explainable_reorder import ExplainableReorderAgent
-from agentic_ai.inventory_simulation_agent import InventorySimulationAgent
+# -----------------------------
+# CONFIG
+# -----------------------------
+FASTAPI_URL = "http://127.0.0.1:8000"
 
-
-# --------------------------------------------------
-# PAGE CONFIG
-# --------------------------------------------------
 st.set_page_config(
     page_title="Health AI | Forecast Agent",
     layout="wide",
     page_icon="📦"
 )
 
-st.title("📦 Health Supply Chain Forecast Agent")
-st.caption("Enterprise-grade demand & lead-time intelligence")
+# -----------------------------
+# HELPERS
+# -----------------------------
+def call_api(path: str, payload: dict, timeout: int = 180) -> dict:
+    url = f"{FASTAPI_URL}{path}"
+    r = requests.post(url, json=payload, timeout=timeout)
+    if r.status_code != 200:
+        raise RuntimeError(f"API {path} failed ({r.status_code}): {r.text}")
+    return r.json()
 
+
+def safe_unique_sorted(series: pd.Series):
+    return sorted(series.dropna().astype(str).str.strip().unique().tolist())
+
+
+def pick_col(df: pd.DataFrame, options: list[str]):
+    for c in options:
+        if c in df.columns:
+            return c
+    return None
+
+
+# -----------------------------
+# HEADER
+# -----------------------------
+st.title("📦 Health Supply Chain Forecast Agent")
+st.caption("Enterprise-grade demand, lead-time, reorder & risk intelligence (API-powered)")
 st.markdown("---")
 
-# --------------------------------------------------
+# -----------------------------
 # SIDEBAR
-# --------------------------------------------------
+# -----------------------------
 st.sidebar.header("⚙️ Configuration")
+forecast_horizon = st.sidebar.selectbox("Forecast Horizon (days)", [7, 14, 30, 60])
+batch_mode = st.sidebar.checkbox("📦 Batch mode (all facilities & items)", value=True)
 
-forecast_horizon = st.sidebar.selectbox(
-    "Forecast Horizon",
-    [7, 14, 30, 60]
-)
+uploaded_file = st.sidebar.file_uploader("Upload Supply Chain CSV", type=["csv"])
+run_button = st.sidebar.button("🚀 Run (via FastAPI)")
 
-batch_mode = st.sidebar.checkbox("📦 Batch forecast (all facilities & items)", value=False)
-uploaded_file = st.sidebar.file_uploader(
-    "Upload Supply Chain CSV",
-    type=["csv"]
-)
+st.sidebar.markdown("---")
+st.sidebar.caption("Backend must be running at:")
+st.sidebar.code(FASTAPI_URL)
 
-run_button = st.sidebar.button("🚀 Run Forecast Agent")
-
-# --------------------------------------------------
+# -----------------------------
 # LOAD DATA
-# --------------------------------------------------
+# -----------------------------
+df_raw = None
 if uploaded_file:
     df_raw = pd.read_csv(uploaded_file)
 
     st.subheader("📄 Raw Data Preview")
-    st.dataframe(df_raw.head())
+    st.dataframe(df_raw.head(20), use_container_width=True)
 
-    # FILTERS
+    # ---- Required fields check (soft) ----
+    # We'll still try to run but show warnings.
+    required = ["facility", "item", "date", "demand"]
+    missing = [c for c in required if c not in df_raw.columns]
+    if missing:
+        st.warning(f"Missing expected columns: {missing}. "
+                   "FastAPI endpoint expects at least facility, item, date, demand.")
+
+    # ---- Filters (only when NOT batch mode) ----
     st.sidebar.subheader("🔎 Filters")
+    if "facility" in df_raw.columns:
+        facility = st.sidebar.selectbox("Facility", ["All"] + safe_unique_sorted(df_raw["facility"]))
+    else:
+        facility = "All"
 
-    facility = st.sidebar.selectbox(
-        "Facility",
-        ["All"] + sorted(df_raw["facility"].unique())
-    )
+    if "item" in df_raw.columns:
+        item = st.sidebar.selectbox("Item", ["All"] + safe_unique_sorted(df_raw["item"]))
+    else:
+        item = "All"
 
-    item = st.sidebar.selectbox(
-        "Item",
-        ["All"] + sorted(df_raw["item"].unique())
-    )
+    df_filtered = df_raw.copy()
+    if not batch_mode:
+        if facility != "All" and "facility" in df_filtered.columns:
+            df_filtered = df_filtered[df_filtered["facility"].astype(str).str.strip() == facility]
+        if item != "All" and "item" in df_filtered.columns:
+            df_filtered = df_filtered[df_filtered["item"].astype(str).str.strip() == item]
+else:
+    df_filtered = None
 
-    if facility != "All":
-        df_raw = df_raw[df_raw["facility"] == facility]
-
-    if item != "All":
-        df_raw = df_raw[df_raw["item"] == item]
-
-# --------------------------------------------------
-# PIPELINE
-# --------------------------------------------------
-if uploaded_file and run_button:
-
+# -----------------------------
+# PIPELINE (API-DRIVEN)
+# -----------------------------
+if df_filtered is not None and run_button:
     st.markdown("---")
-    st.header("📊 Forecast Results")
+    st.header("📊 Results (Computed by FastAPI)")
 
-    df = preprocess_data(
-        df_raw,
-        date_col="date",
-        target_col="demand"
-    )
+    # ---- Inventory column detection for simulation (optional) ----
+    stock_col = pick_col(df_filtered, ["stock_on_hand", "current_stock", "on_hand", "stock"])
 
-    feature_cols = [
-        "y",
-        "stock_on_hand",
-        "day_of_week",
-        "month"
-    ]
+    payload = {
+        "data": df_filtered.to_dict(orient="records"),
+        "date_col": "date",
+        "demand_col": "demand",
+        "horizon": int(forecast_horizon),
+        # optional: tell backend which stock column exists
+        "stock_col": stock_col
+    }
 
-    # -------------------------------
-    # DEMAND MODEL
-    # -------------------------------
-    with st.spinner("Training demand model..."):
-        demand_model, demand_metrics = train_random_forest(
-            df=df,
-            feature_cols=feature_cols,
-            target_col="y"
-        )
+    # ---- Call backend forecast+reorder (Milestone 2A core) ----
+    try:
+        with st.spinner("🚀 Calling FastAPI: /forecast/batch ..."):
+            result = call_api("/forecast/batch", payload)
 
-    col1, col2 = st.columns(2)
-    col1.metric("Demand MAE", f"{demand_metrics['MAE']:.2f}")
-    col2.metric("Demand RMSE", f"{demand_metrics['RMSE']:.2f}")
+        forecast_df = pd.DataFrame(result.get("forecast", []))
+        reorder_df = pd.DataFrame(result.get("reorder", []))
+
+        # -----------------------------
+        # ⚡ FORECAST ENGINE PERFORMANCE
+        # -----------------------------
+        if "performance" in result:
+            st.markdown("---")
+            st.subheader("⚡ Forecast Engine Performance")
+
+            perf_df = pd.DataFrame(result["performance"])
+
+            if not perf_df.empty:
+                col1, col2 = st.columns(2)
+
+                if "cache_hit" in perf_df.columns:
+                    col1.metric(
+                        "Cache Hit Rate",
+                        f"{perf_df['cache_hit'].mean():.0%}"
+                    )
+                else:
+                    col1.metric("Cache Hit Rate", "N/A")
+                if "runtime_sec" in perf_df.columns:
+                    col2.metric(
+                        "Avg Runtime (sec)",
+                        f"{perf_df['runtime_sec'].mean():.2f}"
+                    )
+                else:
+                    col2.metric("Avg Runtime (sec)", "N/A")
+                st.dataframe(perf_df, use_container_width=True)
+            else:
+                st.info("No performance metrics returned by API.")
 
 
-    # -------------------------------
-    # LEAD TIME MODEL
-    # -------------------------------
-    with st.spinner("Training lead-time model..."):
-        lead_model, lead_metrics = train_lead_time_model(df)
+        # -----------------------------
+        # FORECAST DISPLAY
+        # -----------------------------
+        st.subheader("📈 Demand Forecast (Batch)")
+        if forecast_df.empty:
+            st.warning("No forecast rows returned by API.")
+        else:
+            # Make sure ds exists for plotting
+            if "ds" in forecast_df.columns:
+                forecast_df["ds"] = pd.to_datetime(forecast_df["ds"], errors="coerce")
+                forecast_df = forecast_df.dropna(subset=["ds"]).sort_values("ds")
 
-    col3, col4 = st.columns(2)
-    col3.metric("Lead Time MAE", f"{lead_metrics['MAE']:.2f}")
-    col4.metric("Lead Time RMSE", f"{lead_metrics['RMSE']:.2f}")
+            # Simple chart: per item (and facility if many)
+            color_col = "item" if "item" in forecast_df.columns else None
+            facet_col = "facility" if ("facility" in forecast_df.columns and forecast_df["facility"].nunique() <= 6) else None
 
-    # -------------------------------
-    # FUTURE FORECAST
-    # -------------------------------
-    agent = ForecastAgent()
-    future_df = agent.run_future_forecast(
-        model=demand_model,
-        df_processed=df,
-        periods=forecast_horizon
-    )
+            if facet_col:
+                fig = px.line(
+                    forecast_df,
+                    x="ds",
+                    y="forecast",
+                    color=color_col,
+                    facet_row=facet_col,
+                    markers=False,
+                    title="Forecast over time (faceted by facility)"
+                )
+            else:
+                fig = px.line(
+                    forecast_df,
+                    x="ds",
+                    y="forecast",
+                    color=color_col,
+                    markers=False,
+                    title="Forecast over time"
+                )
 
-    st.subheader("📈 Demand Forecast")
+            fig.update_traces(mode="lines")
+            st.plotly_chart(fig, use_container_width=True)
 
-    fig = px.line(
-        future_df,
-        x="ds",
-        y="forecast",
-        markers=True
-    )
-    st.plotly_chart(fig, use_container_width=True)
+            st.markdown("**Forecast table (last 100 rows)**")
+            st.dataframe(forecast_df.tail(100), use_container_width=True)
 
-    # -------------------------------
-    # BATCH FORECAST (ALL FACILITY/ITEM)
-    # -------------------------------
-    if batch_mode:
-        st.markdown("---")
-        st.subheader("🏭 Batch Forecast (All Facilities & Items)")
 
-        try:
-            batch_df = agent.run_batch_forecast(
-                model=demand_model,
-                df=df,
-            periods=forecast_horizon
-            )
+        # -----------------------------
+        # REORDER DISPLAY
+        # -----------------------------
+        st.subheader("📦 Reorder Points & Safety Stock")
+        if reorder_df.empty:
+            st.warning("No reorder rows returned by API.")
+        else:
+            st.dataframe(reorder_df, use_container_width=True)
 
-            st.success(f"✅ Batch forecast generated: {batch_df[['facility','item']].drop_duplicates().shape[0]} combinations")
-            st.dataframe(batch_df.tail(50), use_container_width=True)
+            # Highlight top risk
+            if "reorder_point" in reorder_df.columns:
+                top = reorder_df.sort_values("reorder_point", ascending=False).head(10)
+                st.markdown("**Top 10 highest reorder points**")
+                st.dataframe(top, use_container_width=True)
 
-            # Optional: quick chart by facility (sum forecast)
-            agg = batch_df.groupby(["ds", "facility"], as_index=False)["forecast"].sum()
-            fig_batch = px.line(agg, x="ds", y="forecast", color="facility", markers=False,
-                                title="Total Forecast by Facility (All Items)")
-            st.plotly_chart(fig_batch, use_container_width=True)
-
-        except Exception as e:
-            st.error(f"Batch forecasting failed: {e}")
-
-    # -------------------------------
-    # SHAP EXPLAINABILITY
-    # ------------------------------
-
-    st.subheader("🔍 AI Explainability (SHAP)")
-
-    # Compute SHAP values for demand model
-    shap_explainer, shap_values, X_sample = agent.compute_shap(demand_model, df, feature_cols)
-
-    # Plot global importance
-    st.markdown("**Global Feature Importance (Demand Model)**")
-    fig = plot_global_importance(shap_values, X_sample, title="Demand Drivers")
-    st.pyplot(fig)
-
-    # -------------------------------
-    # LEAD TIME VISUALIZATION
-    # -------------------------------
-    st.subheader("⏳ Lead Time Distribution")
-
-    fig2 = px.histogram(
-        df,
-        x="lead_time_days",
-        nbins=10
-    )
-    st.plotly_chart(fig2, use_container_width=True)
-
-    # -------------------------------
-    # AGENT REASONING
-    # -------------------------------
-    st.subheader("🧠 Agent Explanation")
-
-    reasoner = ReasoningAgent()
-    explanations = reasoner.explain_demand_change(df, future_df)
-
-    for e in explanations:
-        st.info(e)
-
-    # --------------------------------------------------
-    # MULTI-FACILITY / MULTI-ITEM FORECAST
-    # --------------------------------------------------
-    st.markdown("---")
-    st.subheader("🏭 Multi-Facility & Item Forecast")
-
-    batch_forecast_df = agent.run_batch_forecast(
-        df=df,
-        model=demand_model,
-        periods=forecast_horizon
-    )
-
-    st.dataframe(batch_forecast_df.tail(20), use_container_width=True)
-
-    # --------------------------------
-    # PREPARE LEAD TIME DATA
-    # --------------------------------
-    lead_time_df = (
-        df_raw
-        .groupby(["facility", "item"], as_index=False)
-        .agg({"lead_time_days": "mean"})
-    )
-
-    # --------------------------------------------------
-    # REORDER POINT & SAFETY STOCK
-    # --------------------------------------------------
-    from agentic_ai.reorder_agent import ReorderAgent
-
-    st.subheader("📦 Reorder Points & Safety Stock")
-
-    reorder_agent = ReorderAgent()
-    reorder_df = reorder_agent.compute_reorder_point(
-        forecast_df=batch_forecast_df,
-        lead_time_df=lead_time_df
-    )
-
-    st.dataframe(reorder_df, use_container_width=True)
-
-    # -------------------------------
-    # EXPLAINABLE REORDER INSIGHTS
-    # -------------------------------
-    st.subheader("🧠 Why are reorder points high?")
-
-    explain_agent = ExplainableReorderAgent()
-    explanations = explain_agent.explain_reorder_drivers(reorder_df)
-
-    for exp in explanations:
-        st.info(exp)
-
-    # -------------------------------
-    # INVENTORY SIMULATION
-    # -------------------------------
-    st.markdown("---")
-    st.subheader("📉 Inventory Simulation (Stockout Risk)")
-
-    # Build inventory_df from raw input (starting stock per facility/item)
-    possible_stock_cols = [
-        "stock_on_hand",
-        "current_stock",
-        "on_hand",
-        "stock"
-    ]
-    stock_col = None
-    for c in possible_stock_cols:
-        if c in df_raw.columns:
-            stock_col = c
-            break
-
-    if stock_col is None:
-        raise ValueError(
-            "No stock column found. Expected one of: "
-            f"{possible_stock_cols}"
-        )
-
-    inventory_df = (
-        df_raw
-        .sort_values("date")
-        .groupby(["facility", "item"], as_index=False)
-        .agg({stock_col: "last"})
-        .rename(columns={stock_col: "stock_on_hand"})
-    )
-
-    st.write("🔍 Inventory DF columns:", inventory_df.columns.tolist())
-    st.write("🔍 Inventory DF preview:", inventory_df.head())
-
-    if "stock_on_hand" not in inventory_df.columns:
-        st.error("❌ stock_on_hand missing in inventory_df")
+    except Exception as e:
+        st.error(f"❌ API call failed: {e}")
         st.stop()
-    
-    sim_agent = InventorySimulationAgent()
 
-    for col in ["facility", "item"]:
-        batch_forecast_df[col] = batch_forecast_df[col].astype(str).str.strip()
-        inventory_df[col] = inventory_df[col].astype(str).str.strip()
-        reorder_df[col] = reorder_df[col].astype(str).str.strip()
-    
-    cols_to_drop = [
-        c for c in batch_forecast_df.columns
-        if c.startswith("stock_on_hand")
-    ]
+    # -----------------------------
+    # OPTIONAL: Inventory simulation + COO narrative via API
+    # (These require you to add endpoints. We show UI now, and wire later.)
+    # -----------------------------
+    st.markdown("---")
+    st.subheader("📉 Inventory Simulation (optional, via API)")
+    st.caption("Next step: add /simulate/inventory endpoint and enable this section.")
 
-    if cols_to_drop:
-        batch_forecast_df = batch_forecast_df.drop(columns=cols_to_drop)
-    
-    sim_df = sim_agent.simulate(
-        forecast_df=batch_forecast_df,
-        inventory_df=inventory_df,
-        reorder_df=reorder_df,
-        stock_col="stock_on_hand"
-    )
-
-    st.dataframe(sim_df, use_container_width=True)
-
-    # Highlight urgent risks
-    urgent = sim_df.sort_values(["reorder_now", "days_of_cover"], ascending=[False, True]).head(10)
-
-    st.subheader("🚨 Top 10 Urgent Risks")
-    st.dataframe(urgent, use_container_width=True)
-
-
-
-    # -------------------------------
-    # COO EXECUTIVE NARRATIVE
-    # -------------------------------
-    from agentic_ai.narrative_agent import NarrativeAgent
-    
     st.markdown("---")
     st.subheader("🧠 Executive Summary (COO View)")
 
-    api_key = None
     try:
-        api_key = st.secrets["OPENAI_API_KEY"]
-    except Exception:
-        api_key = None
-    
-    narrative_agent = NarrativeAgent(api_key=api_key)
+        payload = {
+            "reorder": reorder_df.to_dict(orient="records"),
+            "horizon_days": forecast_horizon
+        }
 
-    coo_summary = narrative_agent.generate_coo_summary(
-        reorder_df=reorder_df,
-        sim_df=sim_df,
-        forecast_horizon_days=forecast_horizon
-    )
+        with st.spinner("🧠 Generating executive narrative..."):
+            exec_result = call_api(
+                "/executive/summary",
+                payload
+            )
 
-    st.markdown(coo_summary if coo_summary else "⚠️ No executive narrative generated.")
-# --------------------------------------------------
+        st.markdown(exec_result["summary"])
+
+    except Exception as e:
+        st.warning(f"Executive narrative unavailable: {e}")
+
+
+# -----------------------------
 # FOOTER
-# --------------------------------------------------
+# -----------------------------
 st.markdown("---")
-st.caption("© Health AI Ecosystem | Agentic Supply Chain Intelligence")
+st.caption("© Health AI Ecosystem | Agentic Supply Chain Intelligence (Streamlit client + FastAPI backend)")
+
 
 
