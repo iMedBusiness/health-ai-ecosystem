@@ -1,14 +1,16 @@
 # apps/backend/schemas/requests.py
 
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 class BatchForecastRequest(BaseModel):
     data: List[Dict[str, Any]]
-    date_col: str = "date"
-    demand_col: str = "demand"
-    horizon: int = 30
+    date_col: str 
+    demand_col: str 
+    horizon: int 
+    stock_col: Optional[str] = None
 
 class ExecutiveSummaryRequest(BaseModel):
-    reorder: List[Dict]
+    reorder: List[Dict[str, Any]]
+    volatility: List[Dict[str, Any]]
     horizon_days: int

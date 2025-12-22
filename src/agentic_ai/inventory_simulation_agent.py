@@ -1,124 +1,177 @@
+# src/agentic_ai/inventory_simulation_agent.py
+
+from __future__ import annotations
 import pandas as pd
 import numpy as np
 
-
 class InventorySimulationAgent:
     """
-    Simulates inventory position over the forecast horizon and estimates:
-    - stockout date
-    - days of cover
-    - projected end stock
-    - reorder recommendation vs ROP
+    Simulates daily inventory evolution per facility-item given:
+      - forecast_df: columns [facility, item, ds, forecast, lead_time_days]
+      - inventory_df: columns [facility, item, stock_on_hand]
+      - reorder_df: columns [facility, item, reorder_point, avg_daily_demand, lead_time_days]
+
+    Assumptions:
+      - Demand each day = forecast (can be fractional)
+      - Reorder decision is made daily using inventory_position
+      - Orders arrive after lead_time_days (rounded to int days)
+      - Order quantity = order_up_to_days * avg_daily_demand (simple order-up-to policy)
     """
 
     def simulate(
         self,
-        forecast_df,
-        inventory_df,
-        reorder_df=None,
-        date_col="ds",
-        demand_col="forecast",
-        stock_col="stock_on_hand",
-        facility_col="facility",
-        item_col="item"
-    ):
-        """
-        forecast_df must contain: facility, item, ds, forecast
-        inventory_df must contain: facility, item, stock_on_hand (starting stock)
-        reorder_df optional: facility, item, reorder_point
-        """
+        forecast_df: pd.DataFrame,
+        inventory_df: pd.DataFrame,
+        reorder_df: pd.DataFrame,
+        stock_col: str = "stock_on_hand",
+        demand_col: str = "forecast",
+        date_col: str = "ds",
+        lead_time_col: str = "lead_time_days",
+        reorder_point_col: str = "reorder_point",
+        avg_demand_col: str = "avg_daily_demand",
+        order_up_to_days: int = 14,
+        min_order_qty: float = 0.0,
+    ) -> pd.DataFrame:
 
-        # Validate columns
-        req_forecast = {facility_col, item_col, date_col, demand_col}
-        req_inv = {facility_col, item_col, stock_col}
+        # ---------- Validate ----------
+        req_f = {"facility", "item", date_col, demand_col}
+        missing = req_f - set(forecast_df.columns)
+        if missing:
+            raise ValueError(f"forecast_df missing columns: {missing}")
 
-        missing_f = req_forecast - set(forecast_df.columns)
-        missing_i = req_inv - set(inventory_df.columns)
+        req_i = {"facility", "item", stock_col}
+        missing = req_i - set(inventory_df.columns)
+        if missing:
+            raise ValueError(f"inventory_df missing columns: {missing}")
 
-        if missing_f:
-            raise ValueError(f"forecast_df missing columns: {missing_f}")
-        if missing_i:
-            raise ValueError(f"inventory_df missing columns: {missing_i}")
+        req_r = {"facility", "item", reorder_point_col, avg_demand_col}
+        missing = req_r - set(reorder_df.columns)
+        if missing:
+            raise ValueError(f"reorder_df missing columns: {missing}")
 
-        # Merge initial stock into forecast rows
-        df = forecast_df.merge(
-            inventory_df,
-            on=[facility_col, item_col],
+        # ---------- Normalize types ----------
+        f = forecast_df.copy()
+        i = inventory_df.copy()
+        r = reorder_df.copy()
+
+        for df in (f, i, r):
+            for c in ["facility", "item"]:
+                df[c] = df[c].astype(str).str.strip().str.lower()
+
+        f[date_col] = pd.to_datetime(f[date_col], errors="coerce")
+        f = f.dropna(subset=[date_col]).sort_values([ "facility", "item", date_col ])
+
+        i[stock_col] = pd.to_numeric(i[stock_col], errors="coerce").fillna(0.0)
+        r[reorder_point_col] = pd.to_numeric(r[reorder_point_col], errors="coerce")
+        r[avg_demand_col] = pd.to_numeric(r[avg_demand_col], errors="coerce")
+
+        # Lead time: prefer reorder_df lead_time, else forecast_df lead_time, else default 7
+        if lead_time_col in r.columns:
+            r[lead_time_col] = pd.to_numeric(r[lead_time_col], errors="coerce")
+        if lead_time_col in f.columns:
+            f[lead_time_col] = pd.to_numeric(f[lead_time_col], errors="coerce")
+
+        # ---------- Join setup ----------
+        # attach reorder params to each forecast row
+        f = f.merge(
+            r[["facility","item", reorder_point_col, avg_demand_col] + ([lead_time_col] if lead_time_col in r.columns else [])],
+            on=["facility","item"],
             how="left"
         )
 
-        # HARD CHECK
-        if stock_col not in df.columns:
-            raise ValueError(
-                f"'{stock_col}' not found after merge. "
-                f"Available columns: {df.columns.tolist()}"
-            )
-            
-        if df[stock_col].isna().all():
-            raise ValueError(
-                "All stock_on_hand values are NaN after merge. "
-                "Check facility/item alignment."
-            )
+        # attach starting stock
+        f = f.merge(
+            i[["facility","item", stock_col]],
+            on=["facility","item"],
+            how="left"
+        )
 
-        # If reorder_df provided, merge reorder point
-        if reorder_df is not None:
-            df = df.merge(
-                reorder_df[[facility_col, item_col, "reorder_point"]],
-                on=[facility_col, item_col],
-                how="left"
-            )
+        if stock_col not in f.columns:
+            # No inventory information available → assume zero stock
+            f[stock_col] = 0.0
         else:
-            df["reorder_point"] = np.nan
+            f[stock_col] = pd.to_numeric(
+            f[stock_col], errors="coerce"
+            ).fillna(0.0)
+        f[reorder_point_col] = f[reorder_point_col].fillna(np.nan)
+        f[avg_demand_col] = f[avg_demand_col].fillna(np.nan)
 
-        # Ensure date ordering
-        df[date_col] = pd.to_datetime(df[date_col])
-        df = df.sort_values([facility_col, item_col, date_col])
+        # if lead_time missing, take from forecast column, else default
+        if lead_time_col in f.columns:
+            f[lead_time_col] = f[lead_time_col].fillna(7.0)
+        else:
+            f[lead_time_col] = 7.0
 
-        results = []
+        # ---------- Simulation ----------
+        rows = []
 
-        for (facility, item), g in df.groupby([facility_col, item_col]):
-            g = g.copy()
+        for (facility, item), g in f.groupby(["facility", "item"], sort=False):
+            g = g.sort_values(date_col).reset_index(drop=True)
 
-            start_stock = g[stock_col].iloc[0]
-            if pd.isna(start_stock):
-                continue
+            on_hand = float(g.loc[0, stock_col])
+            on_order = []  # list of tuples: (arrival_date, qty)
 
-            # Daily consumption assumed = forecast demand
-            g["projected_stock"] = start_stock - g[demand_col].cumsum()
+            rp = g[reorder_point_col].dropna()
+            rp = float(rp.iloc[0]) if len(rp) else np.nan
 
-            # Stockout detection
-            stockout_rows = g[g["projected_stock"] <= 0]
+            avgd = g[avg_demand_col].dropna()
+            avgd = float(avgd.iloc[0]) if len(avgd) else np.nan
 
-            if len(stockout_rows) > 0:
-                stockout_date = stockout_rows[date_col].iloc[0]
-                days_of_cover = (stockout_date - g[date_col].iloc[0]).days
-            else:
-                stockout_date = None
-                days_of_cover = len(g)
+            # If we can't compute policy params, still simulate consumption (no ordering)
+            can_order = (not np.isnan(rp)) and (not np.isnan(avgd)) and avgd > 0
 
-            end_stock = g["projected_stock"].iloc[-1]
-            reorder_point = g["reorder_point"].iloc[0]
+            for t in range(len(g)):
+                d = g.loc[t, date_col]
+                demand = float(g.loc[t, demand_col]) if pd.notna(g.loc[t, demand_col]) else 0.0
+                lt = g.loc[t, lead_time_col]
+                lt_days = int(max(0, round(float(lt)))) if pd.notna(lt) else 7
 
-            # Reorder recommendation (simple rule)
-            reorder_now = False
-            reorder_qty = None
+                # 1) Receive orders arriving today
+                if on_order:
+                    arriving = [x for x in on_order if x[0] <= d]
+                    if arriving:
+                        recv_qty = sum(q for _, q in arriving)
+                        on_hand += recv_qty
+                        on_order = [x for x in on_order if x[0] > d]
 
-            # If reorder point is known, compare current stock to ROP
-            if not pd.isna(reorder_point):
-                if start_stock <= reorder_point:
+                # 2) Consume demand
+                on_hand = max(0.0, on_hand - demand)
+
+                # 3) Compute inventory position
+                outstanding = sum(q for _, q in on_order) if on_order else 0.0
+                inv_position = on_hand + outstanding
+
+                # 4) Reorder decision
+                reorder_now = False
+                order_qty = 0.0
+                arrival_date = pd.NaT
+
+                if can_order and inv_position <= rp:
                     reorder_now = True
-                    reorder_qty = max(reorder_point - start_stock, 0)
+                    # simple order-up-to: cover N days of demand
+                    order_qty = max(min_order_qty, avgd * float(order_up_to_days))
+                    arrival_date = d + pd.Timedelta(days=lt_days)
+                    if order_qty > 0:
+                        on_order.append((arrival_date, order_qty))
 
-            results.append({
-                "facility": facility,
-                "item": item,
-                "start_stock": round(float(start_stock), 2),
-                "end_stock": round(float(end_stock), 2),
-                "days_of_cover": int(days_of_cover),
-                "stockout_date": stockout_date.strftime("%Y-%m-%d") if stockout_date else None,
-                "reorder_point": round(float(reorder_point), 2) if not pd.isna(reorder_point) else None,
-                "reorder_now": reorder_now,
-                "recommended_reorder_qty": round(float(reorder_qty), 2) if reorder_qty is not None else None
-            })
+                # 5) Days of cover (based on avg demand param, fallback to demand)
+                denom = avgd if (pd.notna(avgd) and avgd > 0) else max(demand, 1e-6)
+                days_of_cover = on_hand / denom
 
-        return pd.DataFrame(results)
+                rows.append({
+                    "facility": facility,
+                    "item": item,
+                    "ds": d,
+                    "forecast": demand,
+                    "stock_on_hand": round(on_hand, 2),
+                    "inventory_position": round(inv_position, 2),
+                    "days_of_cover": round(days_of_cover, 2),
+                    "reorder_point": None if np.isnan(rp) else round(rp, 2),
+                    "lead_time_days": lt_days,
+                    "reorder_now": bool(reorder_now),
+                    "order_qty": round(order_qty, 2),
+                    "order_arrival_ds": arrival_date if pd.notna(arrival_date) else None,
+                    "outstanding_orders_qty": round(outstanding, 2),
+                })
+
+        return pd.DataFrame(rows)

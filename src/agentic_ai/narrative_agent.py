@@ -1,57 +1,141 @@
-# src/agentic_ai/narrative_agent.py
-
 import pandas as pd
 
-
 class NarrativeAgent:
-    def __init__(self):
-        pass
     """
-    Generates executive-level narrative insights.
-    Safe by default (rule-based), LLM optional.
+    Rule-based executive narrative generator (COO-level).
+    Volatility- and inventory-risk aware.
     """
 
     def generate_coo_summary(
         self,
-        reorder_df: pd.DataFrame,
-        sim_df = None,
-        forecast_horizon_days = 30
+        reorder_df,
+        horizon_days: int
     ) -> str:
 
-        if reorder_df.empty:
-            return "No reorder risks detected in the selected horizon."
+        total = len(reorder_df)
 
-        # Top risks
-        top_risk = reorder_df.sort_values(
-            "reorder_point", ascending=False
-        ).head(5)
+        # -----------------------------
+        # Inventory risk distribution
+        # -----------------------------
+        risk_counts = (
+            reorder_df["inventory_risk"]
+            .value_counts(dropna=True)
+            .to_dict()
+            if "inventory_risk" in reorder_df.columns
+            else {}
+        )
 
-        lines = []
-        lines.append("### 🧠 Executive Summary (COO)")
-        lines.append("")
-        lines.append(
-            f"- Forecast horizon: **{horizon_days} days**"
+        high_risk = risk_counts.get("HIGH", 0)
+        med_risk = risk_counts.get("MEDIUM", 0)
+        low_risk = risk_counts.get("LOW", 0)
+
+        # -----------------------------
+        # Volatility distribution
+        # -----------------------------
+        vol_counts = (
+            reorder_df["volatility_class"]
+            .value_counts(dropna=True)
+            .to_dict()
+            if "volatility_class" in reorder_df.columns
+            else {}
         )
-        lines.append(
-            f"- **{len(reorder_df)}** item–facility combinations analyzed"
+
+        erratic = vol_counts.get("Erratic", 0)
+        seasonal = vol_counts.get("Seasonal", 0)
+        stable = vol_counts.get("Stable", 0)
+
+        # -----------------------------
+        # High-risk drivers
+        # -----------------------------
+        high_risk_df = reorder_df[
+            reorder_df["inventory_risk"] == "HIGH"
+        ] if "inventory_risk" in reorder_df.columns else reorder_df.iloc[0:0]
+
+        erratic_high = (
+            high_risk_df["volatility_class"].eq("Erratic").sum()
+            if "volatility_class" in high_risk_df.columns
+            else 0
         )
-        lines.append("")
-        lines.append("#### 🔴 Highest Replenishment Risks")
+
+        urgent_reorders = (
+            high_risk_df["reorder_now"].sum()
+            if "reorder_now" in high_risk_df.columns
+            else 0
+        )
+
+        # -----------------------------
+        # Top exposure items
+        # -----------------------------
+        if "days_of_cover" in reorder_df.columns:
+            top_risk = reorder_df.sort_values(
+                "days_of_cover", ascending=True
+            ).head(5)
+        else:
+            # fallback to reorder pressure
+            top_risk = reorder_df.sort_values(
+                "reorder_point", ascending=False
+            ).head(5)   
+        # -----------------------------
+        # Narrative
+        # -----------------------------
+        summary = f"""
+### 🧠 Executive Summary — COO View
+
+**Planning Horizon:** {horizon_days} days  
+**Item–Facility Combinations Analyzed:** {total}
+
+---
+
+### 🚦 Inventory Risk Snapshot
+- 🔴 **High Risk:** {high_risk}
+- 🟠 **Medium Risk:** {med_risk}
+- 🟢 **Low Risk:** {low_risk}
+
+High-risk items represent **immediate stockout exposure** and require short-term operational intervention.
+
+---
+
+### 📈 Demand Volatility Overview
+- **{erratic} combinations exhibit erratic demand** (highest planning uncertainty)
+- **{seasonal} combinations show seasonal patterns**
+- **{stable} combinations remain demand-stable**
+
+Erratic demand is a **key driver of safety stock pressure and reorder volatility**.
+
+---
+
+### ⚠️ Key Risk Drivers Identified
+- **{erratic_high} high-risk items are driven by erratic demand**
+- **{urgent_reorders} high-risk items require immediate replenishment**
+- Low days of cover combined with demand volatility is the **dominant stockout risk pattern**
+
+---
+
+### 🚨 Most Exposed Items (Lowest Days of Cover)
+"""
 
         for _, r in top_risk.iterrows():
-            lines.append(
-                f"- **{r['item']}** @ **{r['facility']}** → "
-                f"Reorder Point: **{round(r['reorder_point'], 1)}**, "
-                f"Safety Stock: **{round(r['safety_stock'], 1)}**"
+            summary += (
+                f"- **{r['item']}** at **{r['facility']}** | "
+                f"{'Days of Cover: ' + str(round(r['days_of_cover'], 1)) if 'days_of_cover' in r else 'ROP: ' + str(r['reorder_point'])} | "
+                f"Risk: {r.get('inventory_risk', 'Unknown')} | "
+                f"Volatility: {r.get('volatility_class', 'Unknown')}\n"
             )
 
-        lines.append("")
-        lines.append("#### ✅ Recommendations")
-        lines.append("- Prioritize procurement for the above items")
-        lines.append("- Review supplier lead-time reliability")
-        lines.append("- Consider stock rebalancing across facilities")
-        lines.append("- Monitor demand volatility weekly")
+        summary += """
+---
 
-        return "\n".join(lines)
+### ✅ Executive Recommendations
+**Immediate (Next 7–14 Days):**
+- Expedite replenishment for **HIGH-risk items**
+- Prioritize SKUs with **erratic demand and <7 days of cover**
+- Validate supplier lead-time reliability for urgent reorders
 
+**Structural (Next 30–90 Days):**
+- Revisit service levels for erratic-demand SKUs
+- Segment inventory policies by volatility class
+- Consider inventory pooling or demand smoothing for unstable items
+"""
+
+        return summary.strip()
 
