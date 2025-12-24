@@ -11,6 +11,7 @@ class BatchForecastRequest(BaseModel):
     stock_col: Optional[str] = None
 
 class ExecutiveSummaryRequest(BaseModel):
-    reorder: List[Dict[str, Any]]
-    volatility: List[Dict[str, Any]]
+    reorder: list
+    volatility: list
+    inventory_risk: list
     horizon_days: int

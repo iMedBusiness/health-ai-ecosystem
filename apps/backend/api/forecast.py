@@ -10,6 +10,11 @@ from ai_core.data_pipeline import preprocess_data
 from src.ai_core.volatility import classify_volatility
 from src.agentic_ai.inventory_simulation_agent import InventorySimulationAgent
 from src.agentic_ai.inventory_risk_agent import InventoryRiskAgent
+from src.agentic_ai.data_quality_agent import DataQualityAgent
+from src.agentic_ai.confidence_agent import ConfidenceAgent
+from src.agentic_ai.explainable_reorder import ExplainableReorderAgent
+from src.agentic_ai.scenario_agent import ScenarioAgent
+
 
 router = APIRouter()
 
@@ -29,7 +34,6 @@ def batch_forecast(request: BatchForecastRequest):
     Multi-item, multi-facility batch forecast endpoint.
     Fully self-contained: validates, preprocesses, forecasts, reorders.
     """
-
     # --------------------------------------------------
     # 1) Load payload
     # --------------------------------------------------
@@ -72,14 +76,25 @@ def batch_forecast(request: BatchForecastRequest):
     df = _normalize_keys(df, ("facility", "item"))
 
     # --------------------------------------------------
-    # 4) Volatility classification
+    # 4) Volatility classification (FIXED & ALIGNED)
     # --------------------------------------------------
     try:
         vol_df = classify_volatility(df, y_col="y", group_cols=("facility", "item"))
-        vol_df = vol_df.rename(columns={"volatility": "volatility_class"})
+
+        # 🔑 Map numeric-style volatility to planning semantics
+        vol_map = {
+            "Low": "Stable",
+            "Medium": "Seasonal",
+            "High": "Erratic",
+        }
+
+        vol_df["volatility_class"] = vol_df["volatility"].map(vol_map)
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Volatility classification failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Volatility classification failed: {str(e)}"
+        )
 
     # --------------------------------------------------
     # 5) Agents
@@ -155,6 +170,52 @@ def batch_forecast(request: BatchForecastRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Reorder computation failed: {str(e)}")
 
+    # --------------------------------------------------
+    # 9.1) Explainable reorder drivers
+    # --------------------------------------------------
+    explain_agent = ExplainableReorderAgent()
+
+    reorder_explanations = explain_agent.explain_reorder_drivers(reorder_df)
+    reorder_driver_scores = explain_agent.compute_driver_scores(reorder_df)
+
+    # --------------------------------------------------
+    # 9.2) Scenario analysis
+    # --------------------------------------------------
+    scenario_agent = ScenarioAgent()
+    scenario_results = []
+
+    # --- Baseline
+    baseline = reorder_df.copy()
+    baseline["scenario"] = "Baseline"
+    scenario_results.append(baseline)
+
+    # --- Demand surge (+30%)
+    surge_forecast = scenario_agent.run_demand_surge(
+        batch_forecast_df,
+        surge_pct=0.30
+    )
+    surge_reorder = reorder_agent.compute_reorder_point(
+        forecast_df=surge_forecast,
+        demand_col="forecast",
+        lead_time_col="lead_time_days",
+    )
+    surge_reorder["scenario"] = "Demand +30%"
+    scenario_results.append(surge_reorder)
+
+    # --- Lead time shock (+7 days)
+    lt_forecast = scenario_agent.run_lead_time_shock(
+        batch_forecast_df,
+        extra_days=7
+    )
+    lt_reorder = reorder_agent.compute_reorder_point(
+        forecast_df=lt_forecast,
+        demand_col="forecast",
+        lead_time_col="lead_time_days",
+    )
+    lt_reorder["scenario"] = "Lead Time +7d"
+    scenario_results.append(lt_reorder)
+
+    scenario_df = pd.concat(scenario_results, ignore_index=True)
 
     # --------------------------------------------------
     # 10) Build inventory_df (starting stock) for simulation
@@ -198,7 +259,6 @@ def batch_forecast(request: BatchForecastRequest):
                 "request_stock_col": request.stock_col
             }
         )
-
     # --------------------------------------------------
     # 11) Inventory simulation
     # --------------------------------------------------
@@ -235,12 +295,85 @@ def batch_forecast(request: BatchForecastRequest):
             how="left"
         )
         
+    if sim_df["volatility_class"].isna().all():
+        raise RuntimeError(
+            "Volatility missing for all rows — risk scoring would be invalid"
+        )
+    
     # --------------------------------------------------
-    # 11.2) Inventory risk scoring
+    # 11.2) Inventory risk scoring (DEBUG)
     # --------------------------------------------------
     if not sim_df.empty:
         risk_agent = InventoryRiskAgent()
         sim_df = risk_agent.score(sim_df)
+        
+        print("🚨 INVENTORY RISK DEBUG")
+        print(sim_df[["facility", "item", "days_of_cover", "reorder_now", "volatility_class", "inventory_risk"]].head(20))
+
+    # --------------------------------------------------
+    # 11.3) Confidence scoring & data quality guardrails
+    # --------------------------------------------------
+    confidence_results = []
+
+    dq_agent = DataQualityAgent()
+    conf_agent = ConfidenceAgent()
+
+    # Group on PREPROCESSED df (has ds, y)
+    for (facility, item), g in df.groupby(["facility", "item"]):
+        # -----------------------------
+        # Data Quality
+        # -----------------------------
+        dq = dq_agent.assess(g)
+
+        # -----------------------------
+        # Volatility class
+        # -----------------------------
+        vol_match = vol_df.loc[
+            (vol_df["facility"] == facility) &
+            (vol_df["item"] == item),
+            "volatility_class"
+        ].values
+        volatility_class = vol_match[0] if len(vol_match) else "Unknown"
+
+        # -----------------------------
+        # Forecast performance (cache hit)
+        # -----------------------------
+        perf = metrics_df.loc[
+            (metrics_df["facility"] == facility) &
+            (metrics_df["item"] == item)
+        ]
+        forecast_cache_hit = (
+            bool(perf["cache_hit"].iloc[0])
+            if not perf.empty and "cache_hit" in perf.columns
+            else False
+        )
+
+        # -----------------------------
+        # Lead time confidence
+        # -----------------------------
+        lt_rows = batch_forecast_df.loc[
+            (batch_forecast_df["facility"] == facility) &
+            (batch_forecast_df["item"] == item),
+            "lead_time_days"
+        ]
+        lead_time_missing = lt_rows.isna().any()
+
+        # -----------------------------
+        # Confidence score
+        # -----------------------------
+        confidence = conf_agent.score(
+            data_quality=dq,
+            volatility_class=volatility_class,
+            lead_time_missing=lead_time_missing,
+            forecast_cache_hit=forecast_cache_hit
+        )
+
+        confidence_results.append({
+            "facility": facility,
+            "item": item,
+            **confidence
+        })
+
 
     # --------------------------------------------------
     # 12) Response
@@ -260,4 +393,8 @@ def batch_forecast(request: BatchForecastRequest):
         "performance": metrics_df.to_dict(orient="records"),
         "volatility": vol_df.to_dict(orient="records"),
         "inventory": sim_df.to_dict(orient="records"),
+        "confidence": confidence_results,
+        "reorder_explanations": reorder_explanations,
+        "reorder_driver_scores": reorder_driver_scores.to_dict(orient="records"),
+        "scenarios": scenario_df.to_dict(orient="records"),
     }

@@ -11,6 +11,7 @@ def executive_summary(request: ExecutiveSummaryRequest):
 
     reorder_df = pd.DataFrame(request.reorder)
     vol_df = pd.DataFrame(request.volatility)
+    risk_df = pd.DataFrame(request.inventory_risk)
 
     if reorder_df.empty:
         raise HTTPException(
@@ -35,11 +36,26 @@ def executive_summary(request: ExecutiveSummaryRequest):
             how="left"
         )   
 
-    if "inventory_risk" in reorder_df.columns:
-        critical = (reorder_df["inventory_risk"] == "HIGH").sum()
-        reorder_df["executive_flag"] = (
-            "CRITICAL" if critical > 0 else "STABLE"
+    # -----------------------------
+    # Inventory risk (item-level)
+    # -----------------------------
+    if not risk_df.empty:
+        for c in ["facility", "item"]:
+            risk_df[c] = risk_df[c].astype(str).str.strip().str.lower()
+        # Count risks
+        high_risk = risk_df[risk_df["inventory_risk"] == "HIGH"]
+        medium_risk = risk_df[risk_df["inventory_risk"] == "MEDIUM"]
+        low_risk = risk_df[risk_df["inventory_risk"] == "LOW"]
+
+        # Attach executive flags to reorder_df for narrative context
+        reorder_df = reorder_df.merge(
+            risk_df[["facility", "item", "inventory_risk"]],
+            on=["facility", "item"],
+            how="left"
         )
+
+        reorder_df["executive_flag"] = reorder_df["inventory_risk"].fillna("UNKNOWN")
+
 
     # -----------------------------
     # Generate narrative
