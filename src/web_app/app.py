@@ -158,6 +158,8 @@ if df_filtered is not None and run_button:
         ["stock_on_hand", "current_stock", "on_hand", "stock"]
     )
 
+    big_run = len(df_filtered) > 8000  # you can tune this
+
     # -------------------------
     # FORECAST + REORDER API
     # -------------------------
@@ -166,7 +168,12 @@ if df_filtered is not None and run_button:
         "date_col": "date",
         "demand_col": "demand",
         "horizon": int(forecast_horizon),
-        "stock_col": stock_col
+        "stock_col": stock_col,
+        
+        # ✅ summary mode when big
+        "return_forecast_detail": False if big_run else True,
+        "return_inventory_detail": False if big_run else True,
+        "max_detail_rows": 20000
     }
 
     try:
@@ -181,6 +188,8 @@ if df_filtered is not None and run_button:
         explanations = result.get("reorder_explanations", [])
         driver_scores_df = pd.DataFrame(result.get("reorder_driver_scores", []))
         scenario_df = pd.DataFrame(result.get("scenarios", []))
+        inventory_worst_df = pd.DataFrame(result.get("inventory_worst", []))
+        risk_rollup_df = pd.DataFrame(result.get("risk_rollup", []))
         
         
     except Exception as e:
@@ -192,6 +201,7 @@ if df_filtered is not None and run_button:
     st.subheader("📉 Inventory Simulation (Projected Stock + Reorder Timing)")
 
     if inventory_df.empty:
+        st.info("Inventory daily detail omitted (summary mode). Use filtered mode or lower data size to view full daily simulation.")
         st.warning(
             "Inventory simulation not available.\n\n"
             "Possible reasons:\n"

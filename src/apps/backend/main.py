@@ -3,9 +3,9 @@
 from fastapi import FastAPI, UploadFile, File
 import pandas as pd
 
-from agentic_ai.forecast_agent import ForecastAgent
-from agentic_ai.reorder_agent import ReorderAgent
-from ai_core.data_pipeline import preprocess_data
+from src.agentic_ai.forecast_agent import ForecastAgent
+from src.agentic_ai.reorder_agent import ReorderAgent
+from src.ai_core.data_pipeline import preprocess_data
 
 app = FastAPI(
     title="Health AI Supply Chain API",

@@ -1,26 +1,35 @@
 # src/agentic_ai/forecast_agent.py
 
-from ai_core.data_pipeline import load_data, preprocess_data
-from ai_core.model_training import train_random_forest
-from ai_core.future_forecast import forecast_future_demand
-from ai_core.explainability import (
+from email.mime import text
+from src.ai_core.data_pipeline import load_data, preprocess_data
+from src.ai_core.model_training import train_random_forest
+from src.ai_core.future_forecast import forecast_future_demand
+from src.ai_core.explainability import (
     compute_shap_values,
     plot_global_importance
 )
 import shap
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from ai_core.model_cache import (
+from src.ai_core.model_cache import (
     load_cached_model,
     save_cached_model
 )
+import re
+from pathlib import Path
 
 class ForecastAgent:
     """
     Agent responsible for training forecasting-related models.
     """
+    def _safe_name(self, text: str) -> str:
+        """
+        Sanitize text for filesystem-safe cache keys.
+        """
+        return re.sub(r"[^a-zA-Z0-9_-]", "_", str(text).lower())
+
     def train_demand_model(self, df, feature_cols):
-        from ai_core.model_training import train_random_forest
+        from src.ai_core.model_training import train_random_forest
 
         model, metrics = train_random_forest(
             df=df,
@@ -108,12 +117,16 @@ class ForecastAgent:
         parallel=True,
         max_workers=4
     ):
-        from ai_core.model_training import train_random_forest
-        from ai_core.future_forecast import forecast_future_demand
-        from ai_core.model_cache import load_cached_model, save_cached_model
+    
+        from src.ai_core.model_training import train_random_forest
+        from src.ai_core.future_forecast import forecast_future_demand
+        from src.ai_core.model_cache import load_cached_model, save_cached_model
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import pandas as pd
         import time
+        
+        cache_path = Path(cache_dir)
+        cache_path.mkdir(parents=True, exist_ok=True)
 
         required_cols = {"facility", "item", "ds", "y", "day_of_week", "month"}
         missing = required_cols - set(df.columns)
@@ -139,10 +152,23 @@ class ForecastAgent:
             model_name = "rf_demand"
             cache_hit = False
 
+            safe_facility = self._safe_name(facility)
+            safe_item = self._safe_name(item)
+
             model = None
+
             if not force_retrain:
-                model, _ = load_cached_model(cache_dir, facility, item, model_name)
-                cache_hit = model is not None
+                try:
+                    model, _ = load_cached_model(
+                        cache_dir,
+                        safe_facility,
+                        safe_item,
+                        model_name
+                    )
+                    cache_hit = model is not None
+                except Exception:
+                    model = None
+                    cache_hit = False
 
             if model is None:
                 model, _ = train_random_forest(
@@ -150,8 +176,13 @@ class ForecastAgent:
                     feature_cols=feature_cols,
                     target_col="y"
                 )
-                save_cached_model(model, cache_dir, facility, item, model_name)
-
+                save_cached_model(
+                    model,
+                    cache_dir,
+                    safe_facility,
+                    safe_item,
+                    model_name
+                )
             future_df = forecast_future_demand(
                 model=model,
                 df_history=g,
@@ -169,8 +200,8 @@ class ForecastAgent:
                 "cache_hit": cache_hit,
                 "runtime_sec": duration
             }
-
             return future_df, metric
+
 
         if parallel:
             with ThreadPoolExecutor(max_workers=max_workers) as ex:

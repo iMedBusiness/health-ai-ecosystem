@@ -6,7 +6,7 @@ import pandas as pd
 from apps.backend.schemas.requests import BatchForecastRequest
 from src.agentic_ai.forecast_agent import ForecastAgent
 from src.agentic_ai.reorder_agent import ReorderAgent
-from ai_core.data_pipeline import preprocess_data
+from src.ai_core.data_pipeline import preprocess_data
 from src.ai_core.volatility import classify_volatility
 from src.agentic_ai.inventory_simulation_agent import InventorySimulationAgent
 from src.agentic_ai.inventory_risk_agent import InventoryRiskAgent
@@ -294,24 +294,18 @@ def batch_forecast(request: BatchForecastRequest):
             on=["facility", "item"],
             how="left"
         )
+    if not sim_df.empty:
+        risk_agent = InventoryRiskAgent()
+        sim_df = risk_agent.score(sim_df)    
         
     if sim_df["volatility_class"].isna().all():
         raise RuntimeError(
             "Volatility missing for all rows — risk scoring would be invalid"
         )
     
+   
     # --------------------------------------------------
-    # 11.2) Inventory risk scoring (DEBUG)
-    # --------------------------------------------------
-    if not sim_df.empty:
-        risk_agent = InventoryRiskAgent()
-        sim_df = risk_agent.score(sim_df)
-        
-        print("🚨 INVENTORY RISK DEBUG")
-        print(sim_df[["facility", "item", "days_of_cover", "reorder_now", "volatility_class", "inventory_risk"]].head(20))
-
-    # --------------------------------------------------
-    # 11.3) Confidence scoring & data quality guardrails
+    # 11.2) Confidence scoring & data quality guardrails
     # --------------------------------------------------
     confidence_results = []
 
@@ -374,6 +368,48 @@ def batch_forecast(request: BatchForecastRequest):
             **confidence
         })
 
+    # --------------------------------------------------
+    # 11.3) Rollups (ALWAYS returned, lightweight)
+    # --------------------------------------------------
+    inventory_worst = pd.DataFrame()
+    risk_rollup = pd.DataFrame()
+
+    if not sim_df.empty and "stock_on_hand" in sim_df.columns:
+        inventory_worst = (
+            sim_df.groupby(["facility", "item"], as_index=False)
+            .agg(
+                min_stock=("stock_on_hand", "min"),
+                min_days_cover=("days_of_cover", "min"),
+                any_reorder=("reorder_now", "max"),
+            )
+        )
+
+    if not sim_df.empty and "inventory_risk" in sim_df.columns:
+        risk_rollup = (
+            sim_df.assign(
+                risk_level=sim_df["inventory_risk"]
+                .astype(str).str.strip().str.upper()
+                .map({"LOW": 1, "MEDIUM": 2, "HIGH": 3})
+            )
+            .groupby(["facility", "item"], as_index=False)
+            .agg(max_risk=("risk_level", "max"))
+        )
+        risk_rollup["inventory_risk"] = (
+            risk_rollup["max_risk"]
+            .map({1: "LOW", 2: "MEDIUM", 3: "HIGH"})
+            .fillna("UNKNOWN")
+        )
+
+
+    # --------------------------------------------------
+    # RESPONSE SIZE CONTROL (SUMMARY MODE)
+    # --------------------------------------------------
+
+    # Default outputs
+    forecast_out = batch_forecast_df
+    inventory_out = sim_df
+    scenario_out = scenario_df
+
 
     # --------------------------------------------------
     # 12) Response
@@ -383,18 +419,30 @@ def batch_forecast(request: BatchForecastRequest):
         "meta": {
             "horizon_days": request.horizon,
             "records_received": len(df_raw),
-            "forecast_rows": len(batch_forecast_df),
+            "forecast_rows": len(forecast_out),
+            "inventory_rows": len(inventory_out),
+            "scenario_rows": len(scenario_out),
+        
             "reorder_rows": len(reorder_df),
             "cache_hit_rate": round(float(metrics_df["cache_hit"].mean()), 2) if "cache_hit" in metrics_df.columns and not metrics_df.empty else None,
             "avg_runtime_sec": round(float(metrics_df["runtime_sec"].mean()), 2) if "runtime_sec" in metrics_df.columns and not metrics_df.empty else None,
+            "detail_mode": {
+                "forecast": bool(request.return_forecast_detail),
+                "inventory": bool(request.return_inventory_detail),
+                "max_detail_rows": int(request.max_detail_rows),
+            },
         },
-        "forecast": batch_forecast_df.to_dict(orient="records"),
+        # ✅ use the controlled outputs
+        "forecast": forecast_out.to_dict(orient="records"),
+        "inventory": inventory_out.to_dict(orient="records"),
+        "scenarios": scenario_out.to_dict(orient="records"),
+
+        # Always returned
+
         "reorder": reorder_df.to_dict(orient="records"),
         "performance": metrics_df.to_dict(orient="records"),
         "volatility": vol_df.to_dict(orient="records"),
-        "inventory": sim_df.to_dict(orient="records"),
         "confidence": confidence_results,
         "reorder_explanations": reorder_explanations,
         "reorder_driver_scores": reorder_driver_scores.to_dict(orient="records"),
-        "scenarios": scenario_df.to_dict(orient="records"),
     }
