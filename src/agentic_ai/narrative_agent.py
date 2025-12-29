@@ -138,4 +138,33 @@ Erratic demand is a **key driver of safety stock pressure and reorder volatility
 """
 
         return summary.strip()
+    
+
+    def generate_decision_summary(self, decision_df):
+        r = decision_df.iloc[0]
+
+        if r["decision_mode"] == "emergency":
+            headline = f"Emergency procurement required for {r['item']} at {r['facility']}."
+        else:
+            headline = f"Procurement optimization completed for {r['item']} at {r['facility']}."
+
+        situation = f"Trigger condition: {r['trigger_reason']}."
+        cost = f"Estimated procurement cost: {r['expected_cost']:,.2f}."
+        risk = f"Expiry risk classified as {r['inventory_risk']}."
+
+        if r["residual_shortage"] > 0:
+            gap = (
+                f"A residual shortage of {r['residual_shortage']:,.0f} units remains "
+                "and requires executive escalation."
+            )
+        else:
+            gap = "No residual supply gap is expected."
+
+        return {
+            "headline": headline,
+            "situation": situation,
+            "risk": risk,
+            "cost": cost,
+            "gap": gap,
+        }
 
